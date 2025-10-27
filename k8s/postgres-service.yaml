@@ -3,9 +3,9 @@ kind: Service
 metadata:
   name: postgres-service
 spec:
-  type: ClusterIP  # change to LoadBalancer for external access
   selector:
     app: postgres
   ports:
-  - port: 5432
-    targetPort: 5432
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP
