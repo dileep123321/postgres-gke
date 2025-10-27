@@ -1,0 +1,6 @@
+# Ignore local and credential files
+*.log
+*.json
+key.json
+.env
+__pycache__/
