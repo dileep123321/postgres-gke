@@ -1,0 +1,158 @@
+name: CI/CD Pipeline - PostgreSQL on GKE
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # --------------------------------------------------------
+  # 🧩 CI SECTION
+  # --------------------------------------------------------
+
+  checkout:
+    name: Checkout Repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+  dependencies:
+    name: Install Dependencies
+    runs-on: ubuntu-latest
+    needs: checkout
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Linting & Security Tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y yamllint
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+
+  linting:
+    name: YAML Lint Check
+    runs-on: ubuntu-latest
+    needs: dependencies
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run YAML Linter
+        run: |
+          echo "Running yamllint on k8s/ folder..."
+          yamllint k8s/
+
+  trivy_config_scan:
+    name: Trivy Config Scan (K8s Security)
+    runs-on: ubuntu-latest
+    needs: linting
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Scan Kubernetes Manifests
+        run: |
+          echo "Running Trivy config scan on k8s manifests..."
+          trivy config k8s/ || true
+
+  build:
+    name: Build PostgreSQL Image
+    runs-on: ubuntu-latest
+    needs: trivy_config_scan
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Configure Docker to use gcloud as a credential helper
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Build Docker Image
+        run: |
+          docker build -t us-central1-docker.pkg.dev/modern-saga-472703-k3/postgres-repo/postgres:latest .
+
+  trivy_image_scan:
+    name: Trivy Image Scan (Vulnerability Check)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+
+      - name: Scan Docker Image for Vulnerabilities
+        run: |
+          echo "Scanning built image with Trivy..."
+          trivy image --exit-code 0 --severity HIGH,CRITICAL us-central1-docker.pkg.dev/modern-saga-472703-k3/postgres-repo/postgres:latest
+
+  push_artifacts:
+    name: Push Image to Artifact Registry
+    runs-on: ubuntu-latest
+    needs: trivy_image_scan
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Push Docker Image
+        run: |
+          docker push us-central1-docker.pkg.dev/modern-saga-472703-k3/postgres-repo/postgres:latest
+
+  # --------------------------------------------------------
+  # 🚀 CD SECTION
+  # --------------------------------------------------------
+
+  deploy_gke:
+    name: Deploy PostgreSQL to GKE
+    runs-on: ubuntu-latest
+    needs: push_artifacts
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: modern-saga-472703-k3
+          export_default_credentials: true
+
+      - name: Install GKE Auth Plugin
+        run: |
+          gcloud components install gke-gcloud-auth-plugin --quiet
+          echo "USE_GKE_GCLOUD_AUTH_PLUGIN=True" >> $GITHUB_ENV
+
+      - name: Get GKE Credentials
+        run: |
+          gcloud container clusters get-credentials test-demo-cluster \
+            --zone us-central1-a --project modern-saga-472703-k3
+
+      - name: Apply Kubernetes Manifests
+        run: |
+          kubectl apply -f k8s/postgres-configmap.yaml --validate=false
+          kubectl apply -f k8s/postgres-secret.yaml --validate=false
+          kubectl apply -f k8s/postgres-deployment.yaml --validate=false
+          kubectl apply -f k8s/postgres-service.yaml --validate=false
+
+      - name: Verify Deployment
+        run: |
+          kubectl get pods -l app=postgres
+          kubectl get svc postgres-service
